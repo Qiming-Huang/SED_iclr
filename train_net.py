@@ -293,7 +293,7 @@ def setup(args):
 
 def main(args):
     cfg = setup(args)
-    torch.set_float32_matmul_precision("high")
+    # torch.set_float32_matmul_precision("high")
     if args.eval_only:
         model = Trainer.build_model(cfg)
         DetectionCheckpointer(model, save_dir=cfg.OUTPUT_DIR).resume_or_load(

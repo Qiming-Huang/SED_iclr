@@ -97,6 +97,17 @@ class SED(nn.Module):
         self.in_features = in_features
         self.fast_inference = fast_inference
         self.clip_finetune = clip_finetune
+        
+
+        # our evaluation metric
+        self.conf_matrix = {
+            "TP" : 0.0,
+            "FN" : 0.0,
+            "FP" : 0.0
+        }
+        self.results = {thresh: {'TP': 0.0, 'FN': 0.0, 'FP': 0.0} for thresh in [0.1 * i for i in range(1, 10)]}
+        self.counts = {thresh: {'TP': 0.0, 'FN': 0.0, 'FP': 0.0} for thresh in [0.1 * i for i in range(1, 10)]}        
+        self.cot = 0
 
     @classmethod
     def from_config(cls, cfg):
@@ -205,6 +216,10 @@ class SED(nn.Module):
 
             output = sem_seg_postprocess(outputs[0], image_size, height, width)
             processed_results = [{'sem_seg': output}]
+            
+            # our evaluation metric
+            self.CP_mIoU_all_thres(output, batched_inputs[0]['sem_seg'])
+            
             return processed_results
 
 
@@ -251,3 +266,96 @@ class SED(nn.Module):
         width = batched_inputs[0].get("width", out_res[1])
         output = sem_seg_postprocess(outputs[0], out_res, height, width)
         return [{'sem_seg': output}]
+    
+    def compute_iou(self, mask1, mask2):
+        assert mask1.shape == mask2.shape, "The shape of both masks must be the same."
+        mask1 = mask1 > 0
+        mask2 = mask2 > 0
+        
+        # aviod cuda OOM
+        if mask1.device != mask2.device:
+            mask1 = mask1.detach().cpu()
+            mask2 = mask2.detach().cpu()  
+                  
+        intersection = (mask1 & mask2).sum().float()
+        union = (mask1 | mask2).sum().float()
+
+        if union == 0:
+            return 0.0
+        iou = intersection / union
+
+        return iou.item()
+
+    def CP_mIoU_all_thres(self, pred, targets):
+        pred = F.interpolate(pred.unsqueeze(0), size=(targets.shape[-2], targets.shape[-1]), mode="bilinear", align_corners=False)
+        num_classes = pred.shape[1]
+        mask = targets != self.sem_seg_head.ignore_value
+
+        pred = pred.permute(0, 2, 3, 1)  # (1, H, W, num_classes)
+        _onehot = F.one_hot(targets[mask], num_classes=num_classes).float().to(self.device)
+        _targets = torch.zeros(pred.shape, device=self.device)
+        _targets[0, mask] = _onehot
+
+        _targets = _targets[0].permute(2, 0, 1)  # (num_classes, H, W)
+
+        thresholds = [0.1 * i for i in range(1, 10)]
+        results = {thresh: {'TP': 0.0, 'FN': 0.0, 'FP': 0.0} for thresh in thresholds}
+        counts = {thresh: {'TP': 0.0, 'FN': 0.0, 'FP': 0.0} for thresh in thresholds}
+
+        w, h = pred.shape[1], pred.shape[2]
+
+        for thresh in thresholds:
+            pred_thresh = torch.where(pred[0, :, :, :] > thresh, 1.0, 0.0).permute(2, 0, 1)  # (num_classes, H, W)
+            
+            for i in range(pred_thresh.shape[0]):
+                pred_class = pred_thresh[i, :, :]  # 取出第 i 个类别的预测结果
+                target_class = _targets[i, :, :]  # 取出第 i 个类别的真实结果
+                
+                if 1 not in pred_class and 1 not in target_class:
+                    continue
+
+                if 1 in pred_class and 1 in target_class:
+                    iou_value = self.compute_iou(pred_class, target_class)
+                    results[thresh]['TP'] += iou_value
+                    counts[thresh]['TP'] += 1
+                elif 1 in pred_class and 1 not in target_class:
+                    results[thresh]['FP'] += torch.sum(pred_class.detach().cpu() == 1) / (w * h)
+                    counts[thresh]['FP'] += 1
+                elif 1 not in pred_class and 1 in target_class:
+                    results[thresh]['FN'] += torch.sum(target_class.detach().cpu() == 1) / (w * h)
+                    counts[thresh]['FN'] += 1
+
+        # Average the results
+        for thresh in thresholds:
+            if counts[thresh]['TP'] != 0:
+                results[thresh]['TP'] /= counts[thresh]['TP']
+            if counts[thresh]['FN'] != 0:
+                results[thresh]['FN'] /= counts[thresh]['FN']
+            if counts[thresh]['FP'] != 0:
+                results[thresh]['FP'] /= counts[thresh]['FP']
+
+        # Accumulate results
+        for thresh in thresholds:
+            self.results[thresh]['TP'] += results[thresh]['TP']
+            self.results[thresh]['FN'] += results[thresh]['FN']
+            self.results[thresh]['FP'] += results[thresh]['FP']
+        
+        self.cot += 1
+        
+        if self.cot >= 1999:
+            print(f"here we come : {self.cot}")
+            for thresh in thresholds:
+                self.results[thresh]['TP'] /= 2000
+                self.results[thresh]['FN'] /= 2000
+                self.results[thresh]['FP'] /= 2000  
+
+            results_json = {thresh: {k: v.item() if isinstance(v, torch.Tensor) else v for k, v in metrics.items()} 
+                            for thresh, metrics in self.results.items()}
+            
+            print(results_json)
+            # Save self.results to a JSON file
+            import json
+            with open("./res.json", "w") as json_file:
+                json.dump(results_json, json_file)        
+    
+        return results
